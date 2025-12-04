@@ -1,1 +1,451 @@
-5
+import asyncio
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError ,Page
+from utils import is_captcha_page
+from var import USER_SELECTORS, PASS_SELECTORS
+
+
+async def detect_special_page(page, final_url: str, timeout_ms: int = 5000):
+    """
+    Attend jusqu'à timeout_ms ms qu'un champ user OU pass apparaisse.
+    Retourne None si trouvé → on peut remplir.
+    Sinon, retourne un statut spécial selon l'URL.
+    """
+    final_url = final_url.lower()
+
+    # 1. Vérifier CAPTCHA d'abord
+    if await is_captcha_page(page):
+        return "CAPTCHA"
+
+    # 2. Créer des TÂCHES explicites (pas des coroutines brutes)
+    user_task = asyncio.create_task(
+        page.wait_for_selector(USER_SELECTORS, timeout=timeout_ms)
+    )
+    pass_task = asyncio.create_task(
+        page.wait_for_selector(PASS_SELECTORS, timeout=timeout_ms)
+    )
+
+    try:
+        # Attendre la première tâche qui se termine (succès ou échec)
+        done, pending = await asyncio.wait(
+            {user_task, pass_task},
+            timeout=timeout_ms / 1000,
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Annuler les tâches restantes
+        for task in pending:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+        # Si au moins une tâche a réussi → formulaire détecté
+        for task in done:
+            if not task.cancelled():
+                try:
+                    await task  # Cela relancera une exception si timeout interne
+                    print("[TRACE] [DETECT] ✅ Champ de login détecté")
+                    return None  # On peut remplir → pas de statut spécial
+                except Exception:
+                    continue  # Échec sur cette tâche, mais on espère l'autre
+
+    except Exception as e:
+        print(f"[TRACE] [DETECT] Exception globale : {e}")
+
+    # 3. Aucun champ détecté → déterminer le type de page
+    if any(x in final_url for x in ("microsoft", "login.live.com")):
+        return "MICROSOFT"
+    elif any(x in final_url for x in ("google", "accounts.google.com", "gmail")):
+        return "GOOGLE"
+    elif "outlook" in final_url:
+        return "OUTLOOK"
+    else:
+        return "NO_LOGIN_FORM"
+    
+async def detect_page_mail(page: Page, url: str) -> str | None:
+    """
+    Détecte précisément le fournisseur de webmail à l’aide de :
+      - motifs d’URL fiables
+      - contenu HTML/texte spécifique
+      - titre de page
+      - attributs ou scripts caractéristiques
+    Retourne le nom canonique du fournisseur ou 'UNKNOWN'.
+    """
+    lower_url = url.lower().strip()
+
+    # === 1. DÉTECTION PAR URL (prioritaire et fiable) ===
+
+    # Gmail
+    if "mail.google.com" in lower_url:
+        return "gmail"
+
+    # Outlook / Office 365 (Microsoft)
+    if any(
+        pattern in lower_url
+        for pattern in [
+            "outlook.live.com",
+            "outlook.office365.com",
+            "outlook.office.com",
+            "outlook.office.net",
+        ]
+    ) and ("mail" in lower_url or "/owa/" in lower_url or "/mail/" in lower_url):
+        return "outlook"
+
+    # Yahoo Mail
+    if "mail.yahoo.com" in lower_url:
+        return "yahoo"
+
+    # ProtonMail
+    if (
+        "protonmail.com" in lower_url
+        and any(kw in lower_url for kw in ["mail", "login", "secure"])
+    ):
+        return "protonmail"
+
+    # Zoho Mail
+    if any(
+        p in lower_url
+        for p in [
+            "mail.zoho.com",
+            "zoho.com/mail",
+            "zoho.eu/mail",
+            "zoho.com.au/mail",
+        ]
+    ):
+        return "zoho"
+
+    # FastMail
+    if "fastmail.com" in lower_url and any(
+        kw in lower_url for kw in ["mail", "www.fastmail.com"]
+    ):
+        return "fastmail"
+
+    # Mail.ru
+    if "mail.ru" in lower_url and "mail" in lower_url:
+        return "mail.ru"
+
+    # GMX (multi-pays)
+    if any(
+        p in lower_url
+        for p in ["gmx.com", "gmx.net", "gmx.de", "gmx.at", "gmx.ch"]
+    ) and ("mail" in lower_url or "konto.gmx" not in lower_url):
+        return "gmx"
+
+    # iCloud Mail (Apple)
+    if any(
+        p in lower_url
+        for p in ["www.icloud.com/mail", "mail.icloud.com", "beta.icloud.com/mail"]
+    ):
+        return "icloud"
+
+    # Yandex.Mail
+    if any(
+        p in lower_url
+        for p in ["mail.yandex.com", "mail.yandex.ru", "yandex.com/mail"]
+    ):
+        return "yandex"
+    
+    # Proto Mail (interne ou personnalisé)
+    if any(
+        p in lower_url
+        for p in [
+            "protomail.",
+            "/protomail",
+            "/proto-mail",
+            "/proto_mail",
+            "webmail/proto",
+            "proto.mail",
+            "proto-mail.",
+            "/webmail/protomail",
+            "/mail/proto",
+        ]
+    ):
+        return "proto mail"
+
+    # Tutanota
+    if (
+        "tutanota.com" in lower_url
+        and any(kw in lower_url for kw in ["mail", "login", "secure"])
+    ):
+        return "tutanota"
+
+    # Mail.com
+    if "mail.com" in lower_url and not any(
+        fp in lower_url for fp in ["protonmail", "tutanota", "gmx"]
+    ):
+        return "mail.com"
+
+    # IBM Domino / Lotus Notes Web
+    if any(
+        p in lower_url
+        for p in [
+            "domino",
+            "notes",
+            ".nsf?login",
+            "/names.nsf",
+            "mailserv",
+            "lotusweb",
+        ]
+    ) or (
+        "/mail/" in lower_url and "domino" in lower_url
+    ):
+        return "domino"
+
+    # Microsoft Exchange / OWA (On-prem ou hybride)
+    if any(
+        p in lower_url
+        for p in [
+            "/owa/",
+            "/exchange/",
+            "/ecp/",
+            "autodiscover.",
+            "microsoft.com/owa",
+            "/oab/",
+            "mail./owa",  # ex: mail.entreprise.com/owa
+        ]
+    ) or (
+        "exchange" in lower_url and ("mail" in lower_url or "login" in lower_url)
+    ):
+        return "exchange"
+
+    # cPanel Webmail
+    if any(
+        p in lower_url
+        for p in [
+            "/webmail",
+            "/:2095",
+            "/:2096",
+            "/cpanel",
+            "webmail.",
+            ":2095",
+            ":2096",
+        ]
+    ) or (
+        "cpanel" in lower_url and "webmail" in lower_url
+    ):
+        return "cpanel"
+
+    # === 2. EXTRACTION DU CONTENU (fallback robuste) ===
+    try:
+        content = await page.content()
+        content_lower = content.lower()
+        title = (await page.title() or "").lower()
+    except Exception:
+        content_lower = ""
+        title = ""
+
+    # --- Roundcube ---
+    if (
+        "roundcube" in content_lower
+        or "roundcube" in title
+        or ('class="rcmail"' in content)
+        or ('program/js/app.js' in content)
+        or ('<title>Roundcube' in content)
+    ):
+        return "roundcube"
+
+    # --- Horde ---
+    if (
+        "horde" in content_lower
+        or "horde webmail" in title
+        or 'href="/horde/' in content
+        or 'class="horde' in content
+    ):
+        return "horde"
+
+    # --- SquirrelMail ---
+    if (
+        "squirrelmail" in content_lower
+        or "squirrelmail" in title
+        or 'src="src/login.php"' in content
+        or 'SquirrelMail version' in content
+    ):
+        return "squirrelmail"
+
+    # --- Zimbra ---
+    if (
+        ("zimbra" in content_lower or "zimbra" in title)
+        and any(kw in content_lower for kw in [
+            "zimbra/webclient",
+            "zimbramail",
+            "zm_login",
+            "zimbra skin",
+            "zimlet",
+            "ZmMailApp",
+        ])
+    ):
+        return "zimbra"
+
+    # --- Exchange via contenu ---
+    if (
+        ("owa" in content_lower or "outlook web app" in title)
+        and any(kw in content_lower for kw in [
+            "microsoft exchange",
+            "/owa/auth/",
+            "exchweb",
+            "microsoft owa",
+            "owa.min.js",
+        ])
+    ):
+        return "exchange"
+
+    # --- cPanel Webmail via contenu ---
+    if (
+        "webmail" in content_lower
+        and any(kw in content_lower for kw in [
+            "cpanel",
+            "paper_lantern",
+            "x3mail",
+            "theme=dynamic",
+            "/webmail/",
+        ])
+    ):
+        return "cpanel"
+
+    # --- ProtonMail ---
+    if (
+        "protonmail" in content_lower or "proton mail" in content_lower
+        and any(kw in content_lower for kw in [
+            "secure email",
+            "encrypted email",
+            "proton mail",
+            "protonmail_session",
+            "pm_me",
+        ])
+    ):
+        return "proton mail"
+    
+        # --- Proto Mail (service personnalisé ou interne, ≠ Proton Mail) ---
+    if (
+        "protomail" in content_lower or "proto mail" in content_lower
+        and any(kw in content_lower for kw in [
+            "proto mail",
+            "protomail web",
+            "webmail proto",
+            "proto login",
+            "protomail_session",
+            "proto-mail",
+            "messagerie proto",
+        ])
+    ):
+        return "proto mail"
+
+    # --- Zoho Mail ---
+    if (
+        "zoho mail" in content_lower
+        or ("zoho.com" in content_lower and "webmail" in content_lower)
+        or 'zoho.mail' in content_lower
+        or 'ZohoMail' in content
+    ):
+        return "zoho"
+
+    # --- Tutanota ---
+    if (
+        "tutanota" in content_lower
+        and any(kw in content_lower for kw in [
+            "encrypted email",
+            "secure email",
+            "tutanota_session",
+            "Tutanota",
+            "private email",
+        ])
+    ):
+        return "tutanota"
+
+    # --- iCloud Mail ---
+    if (
+        "icloud" in content_lower
+        and any(kw in content_lower for kw in [
+            "apple",
+            "mail_icloud",
+            "icloud mail",
+            "mail-web.com",
+            "apple mail",
+        ])
+    ):
+        return "icloud"
+
+    # --- Yandex.Mail ---
+    if (
+        "yandex" in content_lower
+        and any(kw in content_lower for kw in [
+            "mail.yandex",
+            "yandex mail",
+            "почта",
+            "yandexmail",
+        ])
+    ):
+        return "yandex"
+
+    # --- GMX Mail ---
+    if (
+        "gmx" in content_lower
+        and any(kw in content_lower for kw in [
+            "webmail",
+            "gmx.net",
+            "gmx.com",
+            "gmx-mail",
+            "GMX WebMail",
+        ])
+    ):
+        return "gmx"
+
+    # --- Mail.com ---
+    if (
+        "mail.com" in content_lower
+        and any(kw in content_lower for kw in [
+            "webmail",
+            "mailcom",
+            "Welcome to mail.com",
+        ])
+        and not any(fp in content_lower for fp in ["protonmail", "tutanota"])
+    ):
+        return "mail.com"
+
+    # --- FastMail ---
+    if (
+        "fastmail" in content_lower
+        and any(kw in content_lower for kw in [
+            "fastmail.com",
+            "The Fastest Mail",
+            "FastMail Pty Ltd",
+            "fastmail_session",
+        ])
+    ):
+        return "fastmail"
+
+    # --- Domino / Lotus Notes (contenu) ---
+    if any(kw in content_lower for kw in [
+        "ibm notes",
+        "lotus notes",
+        "domino web access",
+        "names.nsf",
+        "mailserv",
+        "iNotes",
+    ]):
+        return "domino"
+
+    # === 3. DÉTECTION PAR ATTRIBUTS / MÉTA / SCRIPTS (optionnel mais puissant) ===
+    try:
+        # Chercher des indicateurs dans les balises <meta>, <link>, ou scripts
+        metas = await page.eval_on_selector_all("meta", "els => els.map(el => el.content || el.name || '')")
+        links = await page.eval_on_selector_all("link", "els => els.map(el => el.href || '')")
+        scripts = await page.eval_on_selector_all("script", "els => els.map(el => el.src || el.textContent)")
+
+        all_text = " ".join(metas + links + scripts).lower()
+
+        # ProtonMail
+        if "protonmail" in all_text and "session" in all_text:
+            return "protonmail"
+        # Roundcube
+        if "roundcube" in all_text and "program/js" in all_text:
+            return "roundcube"
+        # Exchange
+        if "owa" in all_text and ("microsoft" in all_text or "exchange" in all_text):
+            return "exchange"
+
+    except Exception:
+        pass  # Échec silencieux – pas critique
+
+    return "UNKNOWN"
